@@ -16,6 +16,7 @@ using OSIsoft.AF.PI;
 using System.IO;
 using System.Runtime.CompilerServices;
 using System.Text;
+using System.Text.Json;
 using System.Xml;
 using System.Xml.Serialization;
 using CommonModel.Runtime.Core.Abstractions;
@@ -34,6 +35,17 @@ public sealed class AvevaPiAfAdapter : BaseProtocolAdapter, IWritableProtocolAda
     public const string EntityTypePiPoint           = "piPoint";
     public const string ReplicaSessionHeader = "replicaSession";
     private const string CookieEntityPath = "afcookie";
+
+    // Delete-enrichment index. AF's FindChangedItems reports a removed object as
+    // an AFChangeInfo carrying only its UniqueID GUID — the object is gone, so we
+    // can't read its name/path/attributes anymore. To make a delete event look
+    // like the create/update for the same entity, we remember each entity's
+    // last-known state (entityPath + fields) keyed by that GUID on every
+    // Insert/Update, then replay it when the matching delete arrives. The GUID is
+    // the one identifier present in BOTH the create/update (fields.uniqueId) and
+    // the delete (AFChangeInfo.ID), so it is the durable join key. Stored in the
+    // same cm-checkpoints KV bucket under "<driverId>.afindex/<guid>".
+    private const string DeleteIndexPrefix = "afindex";
 
     // PI Data Archive (PIServer) connections — separate from AF. Resolved
     // lazily on first piPoint operation; one PIServer per descriptor.
@@ -192,7 +204,20 @@ public sealed class AvevaPiAfAdapter : BaseProtocolAdapter, IWritableProtocolAda
                     _selfWriteSessions.Remove(sid);
                     continue;
                 }
-                yield return rec;
+
+                if (rec.ChangeType == ChangeType.Delete)
+                {
+                    // Replay the last-known state (path + fields) so the delete
+                    // mirrors the create/update; falls back to the id-only record
+                    // when the entity was never seen / the index entry is missing.
+                    yield return await EnrichDeleteAsync(descriptor.DriverId, rec, ct);
+                }
+                else
+                {
+                    // Remember the current state so a future delete can be enriched.
+                    await SaveDeleteIndexAsync(descriptor.DriverId, rec, ct);
+                    yield return rec;
+                }
             }
 
             await TrySaveCookieAsync(descriptor.DriverId, _changeCookies[descriptor.DriverId], ct);
@@ -338,6 +363,110 @@ public sealed class AvevaPiAfAdapter : BaseProtocolAdapter, IWritableProtocolAda
             return false;
         }
     }
+
+    // ─── Delete-enrichment index ────────────────────────────────────────────
+    //
+    // Persists an entity's last-known state keyed by its UniqueID GUID so a
+    // later delete (which AF reports with the GUID only) can be replayed with
+    // the same entityPath + fields as the create/update. All operations are
+    // best-effort — the checkpoint store swallows NATS failures and the forward
+    // poll keeps running regardless (a miss just yields the id-only delete).
+
+    private sealed class DeleteIndexEntry
+    {
+        public string EntityType { get; set; } = "";
+        public string EntityPath { get; set; } = "";
+        public Dictionary<string, object?> Fields { get; set; } = new();
+    }
+
+    // Records the current state of an Insert/Update so a future delete for the
+    // same UniqueID can be enriched. No-op if the record carries no uniqueId.
+    private async Task SaveDeleteIndexAsync(string driverId, RawChangeRecord rec, CancellationToken ct)
+    {
+        if (!rec.Fields.TryGetValue("uniqueId", out var idObj) || idObj is null) return;
+        var guid = idObj.ToString();
+        if (string.IsNullOrWhiteSpace(guid)) return;
+
+        var entityType = rec.AdapterMetadata.TryGetValue("entityType", out var et) ? et : "";
+        var entry = new DeleteIndexEntry
+        {
+            EntityType = entityType,
+            EntityPath = rec.EntityPath,
+            Fields     = new Dictionary<string, object?>(rec.Fields)
+        };
+
+        await _checkpoints.SaveAsync(new Checkpoint
+        {
+            DriverId   = driverId,
+            EntityPath = $"{DeleteIndexPrefix}/{guid}",
+            Position   = JsonSerializer.Serialize(entry)
+        }, ct);
+    }
+
+    // Looks up the last-known state for the deleted UniqueID and rebuilds the
+    // record so the delete event matches the create/update shape. Falls back to
+    // the original id-only record on a miss (entity never seen, or index lost).
+    private async Task<RawChangeRecord> EnrichDeleteAsync(
+        string driverId, RawChangeRecord rec, CancellationToken ct)
+    {
+        if (!rec.Fields.TryGetValue("uniqueId", out var idObj) || idObj is null) return rec;
+        var guid = idObj.ToString();
+        if (string.IsNullOrWhiteSpace(guid)) return rec;
+
+        var saved = await _checkpoints.GetAsync(driverId, $"{DeleteIndexPrefix}/{guid}", ct);
+        if (saved is null || string.IsNullOrWhiteSpace(saved.Position))
+        {
+            _logger.LogWarning(
+                "PI AF delete for uniqueId {Guid} could not be enriched (no last-known state in index) — " +
+                "emitting id-only delete. The entity was never seen by this connector since the index existed.",
+                guid);
+            return rec;
+        }
+
+        try
+        {
+            var entry = JsonSerializer.Deserialize<DeleteIndexEntry>(saved.Position);
+            if (entry is null || string.IsNullOrEmpty(entry.EntityPath)) return rec;
+
+            // System.Text.Json materializes object? values as JsonElement; convert
+            // back to a plain CLR graph so NatsPublisher.ToProtoValue serializes
+            // nested objects/arrays correctly instead of stringifying JsonElement.
+            var fields = new Dictionary<string, object?>(entry.Fields.Count);
+            foreach (var (k, v) in entry.Fields)
+                fields[k] = v is JsonElement je ? JsonElementToClr(je) : v;
+
+            _logger.LogDebug(
+                "PI AF enriched delete for {EntityPath} from index (uniqueId={Guid})",
+                entry.EntityPath, guid);
+
+            return new RawChangeRecord
+            {
+                EntityPath      = entry.EntityPath,
+                ChangeType      = ChangeType.Delete,
+                SourceTimestamp = rec.SourceTimestamp,
+                Fields          = fields,
+                AdapterMetadata = rec.AdapterMetadata
+            };
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex,
+                "Failed to deserialize delete-index entry for uniqueId {Guid} — emitting id-only delete.", guid);
+            return rec;
+        }
+    }
+
+    private static object? JsonElementToClr(JsonElement el) => el.ValueKind switch
+    {
+        JsonValueKind.Object => el.EnumerateObject()
+            .ToDictionary(p => p.Name, p => JsonElementToClr(p.Value)),
+        JsonValueKind.Array  => el.EnumerateArray().Select(JsonElementToClr).ToList(),
+        JsonValueKind.String => el.GetString(),
+        JsonValueKind.Number => el.TryGetInt64(out var l) ? l : el.GetDouble(),
+        JsonValueKind.True   => true,
+        JsonValueKind.False  => false,
+        _                    => null
+    };
 
     private static RawChangeRecord? ToRecord(AFDatabase db, AFChangeInfo info, HashSet<string> watchTypes)
     {

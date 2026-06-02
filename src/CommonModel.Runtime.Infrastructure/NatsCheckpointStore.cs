@@ -29,11 +29,14 @@ public sealed class NatsCheckpointStore : ICheckpointStore
 
     public async Task<Checkpoint?> GetAsync(string driverId, string entityPath, CancellationToken ct = default)
     {
-        var kv  = await GetOrCreateKvAsync(ct);
-        var key = BuildKey(driverId, entityPath);
-
+        // Best-effort: connection establishment (GetOrCreateKvAsync) is inside the
+        // try so a NATS outage degrades to "no checkpoint" instead of throwing —
+        // callers (e.g. AvevaPiAfAdapter.EnsureCookieAsync) treat null as "anchor
+        // at current state and keep going" rather than crashing on startup.
         try
         {
+            var kv    = await GetOrCreateKvAsync(ct);
+            var key   = BuildKey(driverId, entityPath);
             var entry = await kv.GetEntryAsync<byte[]>(key, cancellationToken: ct);
             if (entry.Value is null) return null;
             return JsonSerializer.Deserialize<Checkpoint>(entry.Value);
@@ -51,12 +54,14 @@ public sealed class NatsCheckpointStore : ICheckpointStore
 
     public async Task SaveAsync(Checkpoint checkpoint, CancellationToken ct = default)
     {
-        var kv    = await GetOrCreateKvAsync(ct);
-        var key   = BuildKey(checkpoint.DriverId, checkpoint.EntityPath);
-        var bytes = JsonSerializer.SerializeToUtf8Bytes(checkpoint);
-
+        // Best-effort: see GetAsync. A NATS outage logs a warning and is swallowed
+        // — the in-memory position is authoritative; persistence just makes it
+        // survive restarts.
         try
         {
+            var kv    = await GetOrCreateKvAsync(ct);
+            var key   = BuildKey(checkpoint.DriverId, checkpoint.EntityPath);
+            var bytes = JsonSerializer.SerializeToUtf8Bytes(checkpoint);
             await kv.PutAsync(key, bytes, cancellationToken: ct);
         }
         catch (Exception ex)
