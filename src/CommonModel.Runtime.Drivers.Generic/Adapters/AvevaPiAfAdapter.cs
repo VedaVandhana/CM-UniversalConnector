@@ -182,6 +182,17 @@ public sealed class AvevaPiAfAdapter : BaseProtocolAdapter, IWritableProtocolAda
         var db = ResolveDatabase(descriptor);
         var watchTypes = ResolveWatchedTypes(descriptor);
 
+        // One-time full-tree snapshot on connect: the change-cookie API only
+        // returns *deltas*, so the broker would otherwise never learn the
+        // elements that existed before it started. Emitting every element once
+        // (ChangeType.Snapshot) lets the broker mirror the *entire* live PI AF
+        // tree, exactly as PSE shows it.
+        foreach (var rec in EmitFullTree(db, watchTypes, ct))
+        {
+            if (ct.IsCancellationRequested) yield break;
+            yield return rec;
+        }
+
         while (!ct.IsCancellationRequested)
         {
             foreach (var rec in DrainChanges(db, descriptor.DriverId, watchTypes))
@@ -258,6 +269,52 @@ public sealed class AvevaPiAfAdapter : BaseProtocolAdapter, IWritableProtocolAda
                 string.Join(", ", skippedReasons));
         else
             _logger.LogDebug("PI AF poll for '{Driver}': no changes.", driverId);
+    }
+
+    // Walk the whole AF element tree (depth-first) and emit one Snapshot record
+    // per element so the broker learns the entire current structure on connect.
+    // Children are loaded lazily by the AF SDK as we descend; this is a one-time
+    // pass per stream lifecycle. el.GetPath() gives the full ``\\PISystem\DB\..``
+    // path, which encodes the area/system nesting the broker rebuilds from.
+    private IEnumerable<RawChangeRecord> EmitFullTree(
+        AFDatabase db, HashSet<string> watchTypes, CancellationToken ct)
+    {
+        if (!watchTypes.Contains(EntityTypeElement))
+            yield break;
+
+        var ts = DateTimeOffset.UtcNow;
+        var stack = new Stack<AFElement>();
+        foreach (AFElement top in db.Elements)
+            stack.Push(top);
+
+        int emitted = 0;
+        while (stack.Count > 0 && !ct.IsCancellationRequested)
+        {
+            var el = stack.Pop();
+            foreach (AFElement child in el.Elements)
+                stack.Push(child);
+
+            yield return new RawChangeRecord
+            {
+                EntityPath      = $"{EntityTypeElement}/{el.GetPath()}",
+                ChangeType      = ChangeType.Snapshot,
+                SourceTimestamp = ts,
+                Fields          = BuildElementFields(el),
+                AdapterMetadata = new Dictionary<string, string>
+                {
+                    ["source"]     = SourceTypeName,
+                    ["entityType"] = EntityTypeElement,
+                    // Marks this as a full-tree snapshot, not a change. The
+                    // GenericConnector rewrites ChangeType.Snapshot→Insert/Update
+                    // before publishing, so the broker keys on this flag to cache
+                    // the element (for the hierarchy tree) without fanning a
+                    // canonical create/update across the mesh.
+                    ["snapshot"]   = "true",
+                },
+            };
+            emitted++;
+        }
+        _logger.LogInformation("PI AF full-tree snapshot emitted {Count} element(s).", emitted);
     }
 
     // ─── Cookie persistence ─────────────────────────────────────────────────
