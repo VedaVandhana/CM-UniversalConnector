@@ -1,24 +1,27 @@
-# AVEVA PI System Explorer (PI Asset Framework) — Server 2
+# AVEVA PI System Explorer (PI Asset Framework) — Server 2 = BKO Refinery DB
 #
-# Joins server1 in a bidirectional mirror mesh: both servers subscribe to the
-# canonical fanout subjects (cmd.canonical.element.>, cmd.canonical.elementTemplate.>)
-# and apply every command they see — except commands whose envelope metadata
-# carries originDriverId == this driver. That echo-suppression check lives in
-# ReverseChannelService.ToCommand. Publishers republishing CDC → command MUST
-# stamp originDriverId for the loop break to work.
+# This descriptor maps the **BKO Refinery** context (broker ontology
+# `bko_refinery`) to its own AF database (the "Learning" / BKO_Refinery DB).
+# Routing is by targetDriverId: the broker stamps each canonical command with
+# the driver for the instance's context (bko_refinery -> aveva-piaf-server2),
+# and ReverseChannelService.ToCommand only applies commands addressed to this
+# driver (or unaddressed). So nuclear writes go to server1, refinery writes
+# here — no blind mirroring.
 #
-# Adding a third AF server later: copy this file, change driverId, AF connection
-# vars, and the direct command subject. The canonical subjects stay identical.
+# PAUSED: enabled=false until the Refinery context is seeded (templates + the
+# empty Learning DB). Flip to true once `bko_refinery` is populated and the
+# AF2_* env vars point at the Refinery AF database. The forward (nuclear /
+# server1) path is unaffected by this being off.
 
 driverId: aveva-piaf-server2
 context: ctx:asset-framework
 sourceType: avevapi-af
-description: AVEVA PI System Explorer — secondary AF server (mirror peer of server1)
-enabled: true
+description: AVEVA PI System Explorer — BKO Refinery (Learning DB). Paused until refinery is seeded.
+enabled: false
 
 connection:
-  afSystemName: "${AF2_SYSTEM_NAME}"
-  afDatabase:   "${AF2_DATABASE}"
+  afSystemName: "${AF2_SYSTEM_NAME}"        # Refinery AF/PI server (e.g. AVEVA-PI-VIS2)
+  afDatabase:   "${AF2_DATABASE}"           # the Refinery AF database (e.g. Learning / BKO_Refinery)
   username:     "${AF2_USERNAME}"           # leave blank for Windows-integrated auth
   password:     "${AF2_PASSWORD}"
   verifySsl:    false
@@ -50,8 +53,8 @@ nats:
     afServer: "${AF2_SYSTEM_NAME}"
   commandSubjects:
     - "cmd.avevapi-af.aveva-piaf-server2.>"   # direct, targeted writes only to this server
-    - "cmd.canonical.elementTemplate.>"        # canonical fanout — mirror mesh
-    - "cmd.canonical.element.>"                # canonical fanout — mirror mesh
+    - "cmd.canonical.elementTemplate.>"        # canonical — applied only when targetDriverId matches
+    - "cmd.canonical.element.>"                # canonical — applied only when targetDriverId matches
   commandConsumer: aveva-piaf-server2-writer
 
 resilience:
