@@ -759,6 +759,32 @@ public sealed class AvevaPiAfAdapter : BaseProtocolAdapter, IWritableProtocolAda
         }
     }
 
+    /// <summary>
+    /// Resolve a parent element path, creating any missing intermediate
+    /// elements (area / system containers). Used when a new element's parent
+    /// path doesn't yet exist in AVEVA — e.g. the user dragged a renamed system
+    /// template, so "Root\Area\New System" must be materialised before the
+    /// equipment can nest under it. Containers are created untemplated; the
+    /// whole chain is persisted by the caller's db.CheckIn().
+    /// </summary>
+    private static AFElement? EnsureParentPath(AFDatabase db, string parentPath)
+    {
+        var parts = parentPath.Split(new[] { '\\' }, StringSplitOptions.RemoveEmptyEntries);
+        if (parts.Length == 0) return null;
+        // Absolute paths (\\PISystem\Database\Root\…) carry a server + database
+        // qualifier ahead of the db-relative segments — skip those two.
+        var start = parentPath.StartsWith(@"\\") && parts.Length >= 2 ? 2 : 0;
+        AFElement? current = null;
+        for (var i = start; i < parts.Length; i++)
+        {
+            var seg = parts[i];
+            var next = current is null ? db.Elements[seg] : current.Elements[seg];
+            next ??= current is null ? db.Elements.Add(seg) : current.Elements.Add(seg);
+            current = next;
+        }
+        return current;
+    }
+
     private static WriteResult ApplyElement(AFDatabase db, WriteCommand cmd)
     {
         // Path can be supplied either via primary key "path" or fields["path"] / fields["name"]
@@ -778,9 +804,16 @@ public sealed class AvevaPiAfAdapter : BaseProtocolAdapter, IWritableProtocolAda
                     ? db.ElementTemplates[templateName]
                     : null;
                 var parentPath = cmd.Fields.TryGetValue("parent", out var pp) ? pp?.ToString() : null;
-                var parent = !string.IsNullOrWhiteSpace(parentPath)
-                    ? AFObject.FindObject(parentPath, db) as AFElement
-                    : null;
+                AFElement? parent = null;
+                if (!string.IsNullOrWhiteSpace(parentPath))
+                {
+                    // Prefer an existing element at the path; otherwise build the
+                    // missing area/system chain so a brand-new system (e.g. a
+                    // renamed dragged template) nests under it instead of the
+                    // element landing flat at the database root.
+                    parent = AFObject.FindObject(parentPath, db) as AFElement
+                             ?? EnsureParentPath(db, parentPath);
+                }
                 var created = parent is null
                     ? db.Elements.Add(name, template)
                     : parent.Elements.Add(name, template);
