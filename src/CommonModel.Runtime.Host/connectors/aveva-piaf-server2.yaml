@@ -8,20 +8,34 @@
 # driver (or unaddressed). So nuclear writes go to server1, refinery writes
 # here — no blind mirroring.
 #
-# PAUSED: enabled=false until the Refinery context is seeded (templates + the
-# empty Learning DB). Flip to true once `bko_refinery` is populated and the
-# AF2_* env vars point at the Refinery AF database. The forward (nuclear /
-# server1) path is unaffected by this being off.
+# ACTIVE: the broker now stamps every canonical element command with
+# `metadata.targetDriverId` (= the driver for the instance's ontologyId), so
+# bko_refinery writes reach ONLY this driver and bko_nuclear writes reach only
+# server1 — no more refinery elements leaking into BKO_LULU_DB.
+#
+# REQUIRED ENV: the descriptor loader interpolates every dollar-brace token in
+# this file (even in comments — it runs on the raw text before YAML parsing) and
+# throws if the referenced variable is unset, which with FailOnDescriptorError
+# blocks startup. Set AF2_SYSTEM_NAME / AF2_DATABASE / AF2_USERNAME /
+# AF2_PASSWORD in whatever launches UC (see Properties/launchSettings.json). Do
+# NOT write a placeholder token in a comment here, or it will be interpolated.
+# For the current setup Refinery is the same PI box, different AF database:
+#   AF2_SYSTEM_NAME=Aveva-Pi
+#   AF2_DATABASE=BKO_Refinery
+#   AF2_USERNAME=            (blank → Windows-integrated auth, same as server1)
+#   AF2_PASSWORD=
+# Keeping AF2_* as a dedicated set (not reusing AF_*) means Refinery can move to
+# a physically separate PI/AF server later with zero descriptor changes.
 
 driverId: aveva-piaf-server2
 context: ctx:asset-framework
 sourceType: avevapi-af
-description: AVEVA PI System Explorer — BKO Refinery (Learning DB). Paused until refinery is seeded.
-enabled: false
+description: AVEVA PI System Explorer — BKO Refinery (BKO_Refinery DB on the same PI box as server1).
+enabled: true
 
 connection:
-  afSystemName: "${AF2_SYSTEM_NAME}"        # Refinery AF/PI server (e.g. AVEVA-PI-VIS2)
-  afDatabase:   "${AF2_DATABASE}"           # the Refinery AF database (e.g. Learning / BKO_Refinery)
+  afSystemName: "${AF2_SYSTEM_NAME}"        # Refinery AF/PI server — Aveva-Pi (same box as server1 for now)
+  afDatabase:   "${AF2_DATABASE}"           # the Refinery AF database — BKO_Refinery
   username:     "${AF2_USERNAME}"           # leave blank for Windows-integrated auth
   password:     "${AF2_PASSWORD}"
   verifySsl:    false

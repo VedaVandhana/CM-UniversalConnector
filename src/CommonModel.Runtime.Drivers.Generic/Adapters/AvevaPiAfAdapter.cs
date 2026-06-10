@@ -13,6 +13,7 @@ using Microsoft.Extensions.Logging;
 using OSIsoft.AF;
 using OSIsoft.AF.Asset;
 using OSIsoft.AF.PI;
+using System.Collections.Concurrent;
 using System.IO;
 using System.Runtime.CompilerServices;
 using System.Text;
@@ -57,6 +58,15 @@ public sealed class AvevaPiAfAdapter : BaseProtocolAdapter, IWritableProtocolAda
     // Tracks replica-session IDs we have applied via the reverse path so that the
     // forward poll can drop the resulting echo CDC event (loop prevention L1).
     private readonly HashSet<string> _selfWriteSessions = new(StringComparer.OrdinalIgnoreCase);
+
+    // Per-driver "re-emit the full tree on the next poll" flag. Set by a resync
+    // command on the reverse channel (metadata.resync=true) and consumed by the
+    // forward stream loop. The change-cookie API only returns deltas, so when the
+    // broker restarts it asks for a resync to re-learn the entire live PI AF tree.
+    // ConcurrentDictionary because the reverse channel (ApplyAsync) and the
+    // forward stream run on different tasks against this singleton adapter.
+    private readonly ConcurrentDictionary<string, bool> _resyncRequested =
+        new(StringComparer.OrdinalIgnoreCase);
 
     public AvevaPiAfAdapter(ILogger<AvevaPiAfAdapter> logger, ICheckpointStore checkpoints)
     {
@@ -195,6 +205,21 @@ public sealed class AvevaPiAfAdapter : BaseProtocolAdapter, IWritableProtocolAda
 
         while (!ct.IsCancellationRequested)
         {
+            // On-demand resync (broker restart): re-walk the whole tree before
+            // draining this round's deltas. TryRemove clears the flag atomically
+            // so a single request triggers exactly one re-emit.
+            if (_resyncRequested.TryRemove(descriptor.DriverId, out _))
+            {
+                _logger.LogInformation(
+                    "PI AF re-emitting full-tree snapshot for driver '{Driver}' (resync).",
+                    descriptor.DriverId);
+                foreach (var rec in EmitFullTree(db, watchTypes, ct))
+                {
+                    if (ct.IsCancellationRequested) yield break;
+                    yield return rec;
+                }
+            }
+
             foreach (var rec in DrainChanges(db, descriptor.DriverId, watchTypes))
             {
                 if (rec.AdapterMetadata.TryGetValue(ReplicaSessionHeader, out var sid) &&
@@ -313,6 +338,31 @@ public sealed class AvevaPiAfAdapter : BaseProtocolAdapter, IWritableProtocolAda
                 },
             };
             emitted++;
+        }
+
+        // Terminal marker: tells the broker the full tree has been streamed so it
+        // can atomically rebuild its Neo4j hierarchy from the elements just sent
+        // (and prune anything no longer present in PI). Carries no element fields;
+        // the broker keys on metadata.snapshotComplete and never treats it as an
+        // entity. ``snapshot=true`` keeps it on the snapshot path (no canonical
+        // create/update fan-out), and ``count`` is logged on the broker side.
+        if (!ct.IsCancellationRequested)
+        {
+            yield return new RawChangeRecord
+            {
+                EntityPath      = $"{EntityTypeElement}/__snapshot_complete__",
+                ChangeType      = ChangeType.Snapshot,
+                SourceTimestamp = ts,
+                Fields          = new Dictionary<string, object?> { ["name"] = "__snapshot_complete__" },
+                AdapterMetadata = new Dictionary<string, string>
+                {
+                    ["source"]           = SourceTypeName,
+                    ["entityType"]       = EntityTypeElement,
+                    ["snapshot"]         = "true",
+                    ["snapshotComplete"] = "true",
+                    ["count"]            = emitted.ToString(),
+                },
+            };
         }
         _logger.LogInformation("PI AF full-tree snapshot emitted {Count} element(s).", emitted);
     }
@@ -588,6 +638,23 @@ public sealed class AvevaPiAfAdapter : BaseProtocolAdapter, IWritableProtocolAda
         ConnectorDescriptor descriptor, WriteCommand command, CancellationToken ct)
     {
         await Task.Yield();
+
+        // Snapshot resync — NOT a write. The broker publishes a canonical command
+        // carrying metadata.resync=true (targeted via targetDriverId, so it can
+        // resync one driver or, with no target, broadcast to all). We flip the
+        // per-driver flag the forward stream loop checks each poll; it re-walks the
+        // whole AF tree and re-emits the snapshot. This is how the broker re-pulls
+        // the entire live PI hierarchy after a restart — the change-cookie stream
+        // carries deltas only, so without this the broker never relearns the tree.
+        if (command.Metadata.TryGetValue("resync", out var resync) &&
+            string.Equals(resync, "true", StringComparison.OrdinalIgnoreCase))
+        {
+            _resyncRequested[descriptor.DriverId] = true;
+            _logger.LogInformation(
+                "PI AF resync requested for driver '{Driver}' — full-tree snapshot re-emits on next poll.",
+                descriptor.DriverId);
+            return WriteResult.Ok(command.CorrelationId);
+        }
 
         // PI Data Archive (piPoint) commits directly via PIPoint.SaveAttributes —
         // it doesn't participate in the AF database CheckIn / UndoCheckOut
